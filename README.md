@@ -1,131 +1,83 @@
 # plink
 
-Post-payment advertising infrastructure for India. A customer pays → webhook fires → OpenRTB 2.5 bid → Glance lock screen ad in 450ms.
+Post-payment advertising infrastructure. A payment completes → webhook fires → programmatic bid → ad serves on the user's device within 450ms.
 
-**Live server:** https://plink-server-946m.onrender.com  
 Built by [Tanmay Sangam](https://tanmaysangam.vercel.app)
-
----
-
-## The problem
-
-Mobile advertising in India has a targeting problem. Programmatic platforms (InMobi, DAN, Google) target on demographics and browsing history — proxies for purchase intent. The most accurate signal — a transaction that just happened — is locked inside payment processors and never reaches the ad exchange.
-
-Post-payment is the highest-intent moment in a user's session. A customer who just paid ₹800 for dinner is primed for a coupon on dessert from the restaurant next door. That moment expires in seconds and is currently invisible to advertisers.
 
 ---
 
 ## Architecture
 
 ```
-Payment processor                  Plink                         InMobi Exchange
-(Cashfree / Pine Labs)             (FastAPI)                     (OpenRTB 2.5 SSP)
-        │                              │                                  │
-        │  POST /webhook/cashfree      │                                  │
-        │  HMAC-SHA256 signed         ──>                                  │
-        │                              │  verify sig                      │
-        │                              │  parse & normalize phone         │
-        │  {"status":"ok"}            <──                                  │
-        │  (< 50ms)                    │                                  │
-        │                              │  [BackgroundTask starts]         │
-        │                              │                                  │
-        │                              │  build OpenRTB 2.5 bid request  │
-        │                              │  POST /openrtb25/bid ──────────>│
-        │                              │  (450ms timeout)                 │
-        │                              │                                  │  RTB auction
-        │                              │  bid response <─────────────────│  (advertisers compete)
-        │                              │                                  │
-        │                              │                           Glance lock screen ad served
-        │                              │                                  │
-        │                              │  GET /win (nurl) <──────────────│  win notice
-        │                              │  record confirmed revenue        │
+Payment processor              Plink (FastAPI)               Ad Exchange (OpenRTB 2.5)
+       │                             │                                  │
+       │  POST /webhook/{provider}   │                                  │
+       │  HMAC-signed ─────────────> │                                  │
+       │                             │  verify signature                │
+       │                             │  parse + normalize phone         │
+       │  {"status":"ok"}           <─                                  │
+       │  (< 50ms)                   │                                  │
+       │                             │  [BackgroundTask]                │
+       │                             │  build OpenRTB 2.5 bid request  │
+       │                             │  POST /openrtb25/bid ──────────>│
+       │                             │  (450ms timeout)                 │
+       │                             │                          auction + ad served
+       │                             │  GET /win (nurl) <─────────────│
+       │                             │  record confirmed revenue        │
 ```
 
-**Why BackgroundTasks:** The payment processor expects a 200 within ~200ms or it retries. InMobi's RTB window is 450ms. These two constraints cannot both be satisfied in a single synchronous request. `BackgroundTasks` returns 200 to the payment processor immediately; the bid runs async in the same worker process without spawning a thread.
+**Why BackgroundTasks:** Payment processors expect a 200 within ~200ms or they retry. The RTB window is 450ms. These constraints can't be satisfied synchronously — `BackgroundTasks` returns 200 immediately; the bid runs async in the same worker process without spawning threads.
 
-**Why FastAPI over Flask:** Async-native I/O means concurrent webhooks don't block each other at the bid step. Under load, a sync framework (Flask/Django) would stall waiting for InMobi's HTTP response; FastAPI handles concurrent bids without thread pool exhaustion.
-
----
-
-## Platform model (zero merchant friction)
-
-The original design required individual merchants to authorize an SDK or webhook — not viable in India where most offline merchants have no developer access.
-
-**Solution:** B2B platform deals at the payment aggregator level.
-
-| Platform | Coverage | Plink's deal type |
-|---|---|---|
-| Cashfree Marketplace | 800K+ merchants | Register as marketplace sub-merchant; Cashfree sends consolidated webhook per txn |
-| Pine Labs P3P | 1.1M POS terminals | Register as P3P platform partner; Pine Labs sends webhook for every in-store UPI/card transaction |
-
-One signed platform agreement → access to the entire merchant network. Merchants don't know Plink exists. Customers don't know Plink exists.
+**Why FastAPI:** Async-native I/O. Under concurrent webhooks, a sync framework stalls at the bid step waiting for the exchange's HTTP response. FastAPI handles concurrent bids without thread pool exhaustion.
 
 ---
 
 ## Identity resolution
 
-Plink resolves payment phone numbers to Glance device IDs via InMobi's user graph:
-
 ```
 webhook phone number
   │
-  ├─ normalize: strip country code, handle +91 / 0 / 91 prefixes, validate 10-digit
+  ├─ normalize: strip country code, handle prefix variants, validate format
   │
-  ├─ hash: SHA-256(normalized_phone) — Plink never sends raw numbers to InMobi
+  ├─ hash: SHA-256(normalized_phone) — raw number never leaves the server
   │
   └─ bid request: user.buyeruid = sha256_hash
-                  InMobi resolves hash → Glance install → serves on lock screen
+                  exchange resolves hash → device → ad served
 ```
 
-Phone hashing means Plink never transmits PII to InMobi — the raw number stays server-side.
-
-DSP mode (`server/dsp.py`): InMobi can also push bid requests to Plink. Identity resolution reverses — we look up incoming `user.ext.eids` / `user.buyeruid` against our payment store (TTL: 10 minutes from payment timestamp) and bid only if there's a recent payment match.
+Phone numbers are SHA-256 hashed before being sent to the exchange. PII stays server-side.
 
 ---
 
 ## OpenRTB 2.5 implementation
 
-Plink sends three `imp` objects per bid — banner, video, and native — letting InMobi's auction pick the highest-value format:
+Three `imp` objects per bid request — banner, video, and native — letting the exchange's auction pick the highest-value format:
 
 ```python
-# models.py (abbreviated)
 class Banner(BaseModel):
-    w: int = 1080; h: int = 1920  # full Glance lock screen
-    pos: int = 1                  # above the fold
-    api: list[int] = [3, 5]       # MRAID 2 + MRAID 3
+    w: int = 1080; h: int = 1920   # full-screen
+    pos: int = 1                    # above the fold
+    api: list[int] = [3, 5]         # MRAID 2 + MRAID 3
 
 class Video(BaseModel):
     mimes: list[str] = ["video/mp4", "video/webm"]
     minduration: int = 15; maxduration: int = 30
-    protocols: list[int] = [2, 3, 5, 6]  # VAST 2.0/3.0 + wrappers
-    skip: int = 0                          # non-skippable
-    playbackmethod: list[int] = [1]        # auto-play, sound on
+    protocols: list[int] = [2, 3, 5, 6]   # VAST 2.0/3.0 + wrappers
+    skip: int = 0                           # non-skippable
 
 class Native(BaseModel):
-    # OpenRTB Native 1.2 — Glance content card layout
-    # Assets: title (required), 1200×628 image (required), description, sponsor label
+    # OpenRTB Native 1.2
+    # Assets: title (required), main image (required), description, sponsor label
     request: str = '{"ver":"1.2","layout":6,"adunit":4,...}'
 ```
 
-IAB category is inferred from purchase items using a keyword map (`inmobi.py: _IAB_KEYWORD_MAP`) — a list of `(keywords, IAB_code)` tuples scanned in O(n) against the transaction's item names. This lets advertisers target by category (IAB8-5 Food, IAB18 Fashion, etc.) without Plink having to maintain a product taxonomy.
+IAB category is inferred from transaction item names using a keyword map — scanned in O(n) against the item list, no external taxonomy dependency.
 
 ---
 
-## Revenue model
+## DSP mode
 
-```
-Cashfree (conservative — 5% of 300M txns/month):
-  15M txns/month → 59% fill rate → 8.85M impressions
-  ₹70 net CPM (after InMobi 40% rev share) → ₹619K/month
-
-Pine Labs (5% of 20M txns/day):
-  1M txns/day → 59% fill → 885K impressions/day
-  Same CPM → ₹1.86M/month
-
-Blended Month 2: ~₹2.5M/month (~$30K USD)
-```
-
-Assumptions: 59% fill from InMobi historical data for post-payment targeting. 40% InMobi rev share. ₹70 net CPM for banner; ₹180 net for multi-format blended.
+`server/dsp.py` handles incoming bid requests from the exchange (buy-side). Identity resolution reverses — incoming `user.ext.eids` / `user.buyeruid` are matched against a local payment store (TTL: 10 minutes from payment timestamp). Bid only fires if there's a recent payment match for that device.
 
 ---
 
@@ -133,14 +85,12 @@ Assumptions: 59% fill from InMobi historical data for post-payment targeting. 40
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Liveness probe → `{"status":"healthy"}` |
-| `GET` | `/stats` | Live counters: webhooks received, bids sent, wins, confirmed revenue |
-| `POST` | `/webhook/cashfree` | Cashfree Marketplace payment events (HMAC-SHA256 verified) |
-| `POST` | `/webhook/pinelabs` | Pine Labs P3P in-store POS events |
-| `POST` | `/webhook/razorpay` | Razorpay Technology Partner events |
-| `GET` | `/win` | InMobi win notice (nurl) — records confirmed impression revenue |
-| `GET` | `/test/bid` | Fire a test bid (sandbox flag set — no billing) |
-| `POST` | `/openrtb25/bid` | DSP endpoint — receives bid requests from InMobi exchange |
+| `GET` | `/health` | Liveness probe |
+| `GET` | `/stats` | Live counters: webhooks, bids, wins, revenue |
+| `POST` | `/webhook/{provider}` | Payment event webhook (HMAC-SHA256 verified) |
+| `GET` | `/win` | Win notice (nurl) — records confirmed impression |
+| `GET` | `/test/bid` | Test bid with sandbox flag — no billing |
+| `POST` | `/openrtb25/bid` | DSP endpoint for incoming exchange bid requests |
 
 ---
 
@@ -150,52 +100,17 @@ Assumptions: 59% fill from InMobi historical data for post-payment targeting. 40
 cd server
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-cp .env.example .env   # fill in INMOBI_PUBLISHER_ID, INMOBI_PLACEMENT_ID
+cp .env.example .env
 uvicorn main:app --reload
 ```
 
-Test the full flow without InMobi credentials:
-
 ```bash
+# Test the bid pipeline (sandbox — no billing)
 curl http://localhost:8000/test/bid
-# fires a bid against InMobi sandbox; no billing; logs the full bid request/response
-```
-
-Simulate a payment webhook:
-
-```bash
-curl -X POST http://localhost:8000/webhook/cashfree \
-  -H "Content-Type: application/json" \
-  -H "x-webhook-signature: <hmac_sha256>" \
-  -d '{"order_id":"ord_001","phone":"+919876543210","amount":850.00,"currency":"INR","items":["biryani","lassi"],"merchant_id":"m_001"}'
-```
-
----
-
-## Deploy
-
-Railway (current):
-
-```bash
-railway up   # reads railway.toml; sets PORT, ENV=production automatically
-```
-
-Docker:
-
-```bash
-docker build -t plink ./server
-docker run -p 8000:8000 --env-file server/.env plink
 ```
 
 ---
 
 ## Stack
 
-Python 3.12 · FastAPI · Pydantic v2 · httpx (async HTTP) · Docker · Railway
-
----
-
-## Status
-
-Server live. Cashfree and Pine Labs platform deals in progress. InMobi publisher account under review.
+Python 3.12 · FastAPI · Pydantic v2 · httpx (async) · Docker · OpenRTB 2.5
